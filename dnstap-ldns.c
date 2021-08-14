@@ -520,7 +520,7 @@ print_dnstap_frame(const uint8_t *data, size_t len_data, dnstap_output_format fm
 
 	if (!print_dnstap_frame_quiet(d, fp))
 		goto out;
-		
+
 	fflush(fp);
 
 	/* Success. */
@@ -719,9 +719,11 @@ process_data_frame(struct conn *conn)
 			len = conn->len_frame_total - bytes_read;
 
 		/* skip frame length uint32_t */
-		conn_log_data(CONN_TRACE, conn, vecs[i].iov_base + sizeof(uint32_t), vecs[i].iov_len - sizeof(uint32_t), "data frame (%zd) bytes: ", vecs[i].iov_len);
+		conn_log_data(CONN_TRACE, conn, vecs[i].iov_base + sizeof(uint32_t), 
+			vecs[i].iov_len - sizeof(uint32_t), "data frame (%zd) bytes: ", vecs[i].iov_len);
 
-		if (!print_dnstap_frame((uint8_t *)vecs[i].iov_base + sizeof(uint32_t), len - sizeof(uint32_t), dnstap_output_format_quiet, stdout)) {
+		if (!print_dnstap_frame((uint8_t *)vecs[i].iov_base + sizeof(uint32_t), 
+			len - sizeof(uint32_t), dnstap_output_format_quiet, stdout)) {
 			fputs("Error: print_dnstap_frame() failed.\n", stderr);
 		}
 
