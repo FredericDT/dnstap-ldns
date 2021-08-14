@@ -24,12 +24,15 @@ bin_PROGRAMS += dnstap-ldns
 dnstap_ldns_SOURCES = \
 	dnstap-ldns.c \
 	host2str.c \
+	fstrm/libmy/argv.c \
 	${PROTOBUF_SOURCES}
 dnstap_ldns_CFLAGS = \
 	${libldns_CFLAGS} \
 	${libfstrm_CFLAGS} \
-	${libprotobuf_c_CFLAGS}
+	${libprotobuf_c_CFLAGS} \
+	${libevent_CFLAGS}
 dnstap_ldns_LDADD = \
 	${libldns_LIBS} \
 	${libfstrm_LIBS} \
-	${libprotobuf_c_LIBS}
+	${libprotobuf_c_LIBS} \
+	${libevent_LIBS}

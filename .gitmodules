@@ -1,3 +1,6 @@
 [submodule "dnstap.pb"]
 	path = dnstap.pb
 	url = git@github.com:dnstap/dnstap.pb.git
+[submodule "fstrm"]
+	path = fstrm
+	url = git@github.com:farsightsec/fstrm.git

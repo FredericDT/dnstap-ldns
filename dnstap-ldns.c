@@ -15,7 +15,14 @@
  */
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,11 +35,94 @@
 #include <fstrm.h>
 #include <ldns/ldns.h>
 
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
+#include <event2/event.h>
+#include <event2/listener.h>
+
 #include "dnstap.pb/dnstap.pb-c.h"
+
+#include "fstrm/libmy/argv.h"
+#include "fstrm/libmy/my_alloc.h"
+#include "fstrm/libmy/print_string.h"
 
 /* From our host2str.c. */
 ldns_status my_ldns_pktheader2buffer_str(ldns_buffer *, const ldns_pkt *);
 ldns_status my_ldns_pkt2buffer_str_fmt(ldns_buffer *, const ldns_output_format *, const ldns_pkt *);
+
+#if HAVE_DECL_FFLUSH_UNLOCKED
+# define fflush fflush_unlocked
+#endif
+
+#if HAVE_DECL_FREAD_UNLOCKED
+# define fread fread_unlocked
+#endif
+
+#if HAVE_DECL_FWRITE_UNLOCKED
+# define fwrite fwrite_unlocked
+#endif
+
+struct capture;
+struct capture_args;
+struct conn;
+
+typedef enum {
+	CONN_STATE_READING_CONTROL_READY,
+	CONN_STATE_READING_CONTROL_START,
+	CONN_STATE_READING_DATA,
+	CONN_STATE_STOPPED,
+} conn_state;
+
+typedef enum conn_verbosity {
+	CONN_CRITICAL		= 0,
+	CONN_ERROR		= 1,
+	CONN_WARNING		= 2,
+	CONN_INFO		= 3,
+	CONN_DEBUG		= 4,
+	CONN_TRACE		= 5,
+} conn_verbosity;
+
+struct conn {
+	struct capture		*ctx;
+	conn_state		state;
+	uint32_t		len_frame_payload;
+	uint32_t		len_frame_total;
+	size_t			len_buf;
+	size_t			bytes_read;
+	size_t			bytes_skip;
+	size_t			count_read;
+	struct bufferevent	*bev;
+	struct evbuffer		*ev_input;
+	struct evbuffer		*ev_output;
+	struct fstrm_control	*control;
+};
+
+struct capture {
+	struct capture_args	*args;
+
+	struct sockaddr_storage	ss;
+	socklen_t		ss_len;
+	evutil_socket_t		listen_fd;
+	struct event_base	*ev_base;
+	struct evconnlistener	*ev_connlistener;
+	struct event		*ev_sighup;
+
+	size_t			bytes_written;
+	size_t			count_written;
+	size_t			capture_highwater;
+	int			remaining_connections;
+
+};
+
+struct capture_args {
+	bool			help;
+	int			debug;
+	char			*str_content_type;
+	char			*str_read_tcp_address;
+	char			*str_read_tcp_port;
+	int			buffer_size;
+	int			count_connections;
+};
 
 static const char g_dnstap_content_type[] = "protobuf:dnstap.Dnstap";
 
@@ -46,24 +136,52 @@ typedef enum {
 	dnstap_output_format_quiet = 1,
 } dnstap_output_format;
 
-static void
-print_string(const void *data, size_t len, FILE *out)
-{
-	uint8_t *str = (uint8_t *) data;
-	fputc('"', out);
-	while (len-- != 0) {
-		unsigned c = *(str++);
-		if (isprint(c)) {
-			if (c == '"')
-				fputs("\\\"", out);
-			else
-				fputc(c, out);
-		} else {
-			fprintf(out, "\\x%02x", c);
-		}
-	}
-	fputc('"', out);
-}
+
+static struct capture		g_program_ctx;
+static struct capture_args	g_program_args = {
+	.str_content_type = g_dnstap_content_type, 
+};
+
+static argv_t g_args[] = {
+	{ 'h',	"help",
+		ARGV_BOOL,
+		&g_program_args.help,
+		NULL,
+		"display this help text and exit" },
+
+	{ 'd',	"debug",
+		ARGV_INCR,
+		&g_program_args.debug,
+		NULL,
+		"increment debugging level" },
+
+	{ 'a',	"tcp",
+		ARGV_CHAR_P,
+		&g_program_args.str_read_tcp_address,
+		"<ADDRESS>",
+		"TCP socket address to read from" },
+
+	{ 'p',	"port",
+		ARGV_CHAR_P,
+		&g_program_args.str_read_tcp_port,
+		"<PORT>",
+		"TCP socket port to read from" },
+
+	{ 'b',	"buffersize",
+		ARGV_INT,
+		&g_program_args.buffer_size,
+		"<SIZE>",
+		"read buffer size, in bytes (default 262144)" },
+
+	{ 'c', "maxconns",
+		ARGV_INT,
+		&g_program_args.count_connections,
+		"<COUNT>",
+		"maximum concurrent connections allowed" },
+
+	{ ARGV_LAST, 0, 0, 0, 0, 0 },
+};
+
 
 static bool
 print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
@@ -373,151 +491,12 @@ print_dnstap_message_quiet(const Dnstap__Message *m, FILE *fp)
 }
 
 static bool
-print_dnstap_message_yaml(const Dnstap__Message *m, FILE *fp)
-{
-	/* Print 'type' field. */
-	const ProtobufCEnumValue *m_type =
-		protobuf_c_enum_descriptor_get_value(
-			&dnstap__message__type__descriptor,
-			m->type);
-	if (!m_type)
-		return false;
-	fputs("  type: ", fp);
-	fputs(m_type->name, fp);
-	fputc('\n', fp);
-
-	/* Print 'query_time' field. */
-	if (m->has_query_time_sec && m->has_query_time_nsec) {
-		fputs("  query_time: !!timestamp ", fp);
-		print_timestamp(m->query_time_sec, m->query_time_nsec, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'response_time' field. */
-	if (m->has_response_time_sec && m->has_response_time_nsec) {
-		fputs("  response_time: !!timestamp ", fp);
-		print_timestamp(m->response_time_sec, m->response_time_nsec, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'socket_family' field. */
-	if (m->has_socket_family) {
-		const ProtobufCEnumValue *type =
-			protobuf_c_enum_descriptor_get_value(
-				&dnstap__socket_family__descriptor,
-				m->socket_family);
-		if (!type)
-			return false;
-		fputs("  socket_family: ", fp);
-		fputs(type->name, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'socket_protocol' field. */
-	if (m->has_socket_protocol) {
-		const ProtobufCEnumValue *type =
-			protobuf_c_enum_descriptor_get_value(
-				&dnstap__socket_protocol__descriptor,
-				m->socket_protocol);
-		if (!type)
-			return false;
-		fputs("  socket_protocol: ", fp);
-		fputs(type->name, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'query_address' field. */
-	if (m->has_query_address) {
-		fputs("  query_address: ", fp);
-		print_ip_address(&m->query_address, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'response_address field. */
-	if (m->has_response_address) {
-		fputs("  response_address: ", fp);
-		print_ip_address(&m->response_address, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'query_port' field. */
-	if (m->has_query_port)
-		fprintf(fp, "  query_port: %u\n", m->query_port);
-
-	/* Print 'response_port' field. */
-	if (m->has_response_port)
-		fprintf(fp, "  response_port: %u\n", m->response_port);
-
-	/* Print 'query_zone' field. */
-	if (m->has_query_zone && m->query_zone.data != NULL) {
-		fputs("  query_zone: ", fp);
-		print_domain_name(&m->query_zone, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'query_message' field. */
-	if (m->has_query_message) {
-		if (!print_dns_message(&m->query_message, "query_message", fp))
-			return false;
-	}
-
-	/* Print 'response_message' field .*/
-	if (m->has_response_message) {
-		if (!print_dns_message(&m->response_message, "response_message", fp))
-			return false;
-	}
-
-	/* Success. */
-	fputs("---\n", fp);
-	return true;
-}
-
-static bool
 print_dnstap_frame_quiet(const Dnstap__Dnstap *d, FILE *fp)
 {
 	if (d->type == DNSTAP__DNSTAP__TYPE__MESSAGE && d->message != NULL) {
 		return print_dnstap_message_quiet(d->message, fp);
 	} else {
 		fputs("[unhandled Dnstap.Type]\n", fp);
-	}
-
-	/* Success. */
-	return true;
-}
-
-static bool
-print_dnstap_frame_yaml(const Dnstap__Dnstap *d, FILE *fp)
-{
-	/* Print 'type' field. */
-	const ProtobufCEnumValue *d_type =
-		protobuf_c_enum_descriptor_get_value(
-			&dnstap__dnstap__type__descriptor,
-			d->type);
-	if (!d_type)
-		return false;
-	fputs("type: ", fp);
-	fputs(d_type->name, fp);
-	fputc('\n', fp);
-
-	/* Print 'identity' field. */
-	if (d->has_identity) {
-		fputs("identity: ", fp);
-		print_string(d->identity.data, d->identity.len, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'version' field. */
-	if (d->has_version) {
-		fputs("version: ", fp);
-		print_string(d->version.data, d->version.len, fp);
-		fputc('\n', fp);
-	}
-
-	/* Print 'message' field. */
-	if (d->type == DNSTAP__DNSTAP__TYPE__MESSAGE && d->message != NULL) {
-		fputs("message:\n", fp);
-		if (!print_dnstap_message_yaml(d->message, fp))
-			return false;
 	}
 
 	/* Success. */
@@ -539,16 +518,8 @@ print_dnstap_frame(const uint8_t *data, size_t len_data, dnstap_output_format fm
 		goto out;
 	}
 
-	if (fmt == dnstap_output_format_yaml) {
-		if (!print_dnstap_frame_yaml(d, fp))
-			goto out;
-	} else if (fmt == dnstap_output_format_quiet) {
-		if (!print_dnstap_frame_quiet(d, fp))
-			goto out;
-	} else {
-		fprintf(stderr, "%s: unknown output format %d\n", __func__, fmt);
+	if (!print_dnstap_frame_quiet(d, fp))
 		goto out;
-	}
 
 	/* Success. */
 	rv = true;
@@ -562,296 +533,746 @@ out:
 	return rv;
 }
 
-static bool
-verify_content_type(struct fstrm_reader *r, const uint8_t *content_type,
-		    size_t len_content_type)
+static struct conn *
+conn_init(struct capture *ctx)
 {
-	fstrm_res res;
-	const struct fstrm_control *control = NULL;
-	size_t n_content_type = 0;
-	const uint8_t *r_content_type = NULL;
-	size_t len_r_content_type = 0;
-
-	res = fstrm_reader_get_control(r, FSTRM_CONTROL_START, &control);
-	if (res != fstrm_res_success)
-		return false;
-
-	res = fstrm_control_get_num_field_content_type(control, &n_content_type);
-	if (res != fstrm_res_success)
-		return false;
-	if (n_content_type > 0) {
-		res = fstrm_control_get_field_content_type(control, 0,
-			&r_content_type, &len_r_content_type);
-		if (res != fstrm_res_success)
-			return false;
-
-		if (len_content_type != len_r_content_type)
-			return false;
-
-		if (memcmp(content_type, r_content_type, len_content_type) == 0)
-			return true;
-	}
-
-	return false;
+	struct conn *conn;
+	conn = my_calloc(1, sizeof(*conn));
+	conn->ctx = ctx;
+	conn->state = CONN_STATE_READING_CONTROL_READY;
+	conn->control = fstrm_control_init();
+	return conn;
 }
 
 static void
-usage(void)
+conn_destroy(struct conn **conn)
 {
-	fprintf(stderr, "Usage: dnstap-ldns [OPTION]...\n");
-	fprintf(stderr, "  -q        Use quiet text output format\n");
-	fprintf(stderr, "  -y        Use verbose YAML output format\n");
-	fprintf(stderr, "  -x        Input format is hexlified protobuf or NULL RR\n");
-	fprintf(stderr, "  -r <FILE> Read dnstap payloads from file\n");
-	fprintf(stderr, "\n");
-	fprintf(stderr, "Quiet text output format mnemonics:\n");
-	fprintf(stderr, "  AQ: AUTH_QUERY\n");
-	fprintf(stderr, "  AR: AUTH_RESPONSE\n");
-	fprintf(stderr, "  RQ: RESOLVER_QUERY\n");
-	fprintf(stderr, "  RR: RESOLVER_RESPONSE\n");
-	fprintf(stderr, "  CQ: CLIENT_QUERY\n");
-	fprintf(stderr, "  CR: CLIENT_RESPONSE\n");
-	fprintf(stderr, "  FQ: FORWARDER_QUERY\n");
-	fprintf(stderr, "  FR: FORWARDER_RESPONSE\n");
-	fprintf(stderr, "  SQ: STUB_QUERY\n");
-	fprintf(stderr, "  SR: STUB_RESPONSE\n");
-	fprintf(stderr, "  TQ: TOOL_QUERY\n");
-	fprintf(stderr, "  TR: TOOL_RESPONSE\n");
-	fprintf(stderr, "\n");
+	if (*conn != NULL) {
+		fstrm_control_destroy(&(*conn)->control);
+		my_free(*conn);
+	}
+}
+
+static void
+conn_log(int level, struct conn *conn, const char *format, ...)
+{
+	if (level > conn->ctx->args->debug)
+		return;
+	int fd = -1;
+
+	if (conn->bev != NULL)
+		fd = (int) bufferevent_getfd(conn->bev);
+
+	fprintf(stderr, "%s: connection fd %d: ", argv_program, fd);
+
+	va_list args;
+	va_start(args, format);
+	vfprintf(stderr, format, args);
+	va_end(args);
+
+	fputc('\n', stderr);
+}
+
+static void
+conn_log_data(int level, struct conn *conn, const void *data, size_t len, const char *format, ...)
+{
+	if (level > conn->ctx->args->debug)
+		return;
+	fprintf(stderr, "%s: connection fd %d: ", argv_program,
+		(int) bufferevent_getfd(conn->bev));
+
+	va_list args;
+	va_start(args, format);
+	vfprintf(stderr, format, args);
+	va_end(args);
+
+	print_string(data, len, stderr);
+	fputc('\n', stderr);
+}
+
+static void
+cb_close_conn(struct bufferevent *bev, short error, void *arg)
+{
+	struct conn *conn = (struct conn *) arg;
+	struct capture *ctx = conn->ctx;
+
+	if (error & BEV_EVENT_ERROR)
+		conn_log(CONN_CRITICAL, conn, "libevent error: %s (%d)",
+			 strerror(errno), errno);
+
+	conn_log(CONN_INFO, conn, "closing (read %zd frames, %zd bytes)",
+		 conn->count_read, conn->bytes_read);
+
+	/*
+	 * The BEV_OPT_CLOSE_ON_FREE flag is set on our bufferevent's, so the
+	 * following call to bufferevent_free() will close the underlying
+	 * socket transport.
+	 */
+	bufferevent_free(bev);
+	conn_destroy(&conn);
+
+	ctx->remaining_connections++;
+	if (ctx->remaining_connections == 1)
+		evconnlistener_enable(ctx->ev_connlistener);
+}
+
+static bool
+usage(const char *msg)
+{
+	if (msg)
+		fprintf(stderr, "%s: Usage error: %s\n", argv_program, msg);
+	argv_usage(g_args, ARGV_USAGE_DEFAULT);
+	argv_cleanup(g_args);
 	exit(EXIT_FAILURE);
 }
 
-static int
-read_input_frame_stream(const char *input_fname,
-			const dnstap_output_format fmt)
+static bool
+parse_args(const int argc, char **argv, struct capture *ctx)
 {
-	struct fstrm_reader *r = NULL;
-	int rv = EXIT_FAILURE;
-	fstrm_res res;
+	argv_version_string = PACKAGE_VERSION;
 
-	if (input_fname) {
-		/* Setup file reader options. */
-		struct fstrm_file_options *fopt;
-		fopt = fstrm_file_options_init();
-		fstrm_file_options_set_file_path(fopt, input_fname);
+	if (argv_process(g_args, argc, argv) != 0)
+		return false;
 
-		/* Initialize file reader. */
-		r = fstrm_file_reader_init(fopt, NULL);
-		if (!r) {
-			fputs("Error: fstrm_file_reader_init() failed.\n", stderr);
-			goto out;
-		}
-		res = fstrm_reader_open(r);
-		if (res != fstrm_res_success) {
-			fputs("Error: fstrm_reader_option() failed.\n", stderr);
-			goto out;
-		}
+	/* Validate args. */
+	if (g_program_args.help)
+		return false;
+	if (
+	    g_program_args.str_read_tcp_address == NULL)
+		usage("--tcp must be set");
+	if (g_program_args.str_read_tcp_port == NULL)
+		usage("If --tcp is set, --port must also be set");
+	g_program_ctx.capture_highwater = 262144;
+	if (g_program_args.buffer_size > 0)
+		g_program_ctx.capture_highwater = (size_t)g_program_args.buffer_size;
+	g_program_ctx.remaining_connections = -1; /* unlimited connections. */
+	if (g_program_args.count_connections > 0)
+		g_program_ctx.remaining_connections = (unsigned)g_program_args.count_connections;
 
-		/* Cleanup. */
-		fstrm_file_options_destroy(&fopt);
-
-		/* Verify "Content Type" field. */
-		if (!verify_content_type(r, (const uint8_t *) g_dnstap_content_type,
-					 strlen(g_dnstap_content_type)))
-		{
-			fprintf(stderr, "Error: %s is not a dnstap file.\n", input_fname);
-			goto out;
-		}
-	} else {
-		fprintf(stderr, "Error: no input specified, try -r <FILE>.\n\n");
-		usage();
-	}
-
-	/* Loop over data frames. */
-	for (;;) {
-		const uint8_t *data;
-		size_t len_data;
-
-		res = fstrm_reader_read(r, &data, &len_data);
-		if (res == fstrm_res_success) {
-			/* Data frame ready. */
-			if (!print_dnstap_frame(data, len_data, fmt, stdout)) {
-				fputs("Error: print_dnstap_frame() failed.\n", stderr);
-				goto out;
-			}
-		} else if (res == fstrm_res_stop) {
-			/* Normal end of data stream. */
-			rv = EXIT_SUCCESS;
-			goto out;
-		} else {
-			/* Abnormal end. */
-			fputs("Error: fstrm_reader_read() failed.\n", stderr);
-			goto out;
-		}
-	}
-
-out:
-	/* Cleanup. */
-	fstrm_reader_destroy(&r);
-
-	return rv;
+	return true;
 }
 
-static int
-read_input_hex(const char *input_fname,
-	       const dnstap_output_format fmt)
+static bool
+open_read_tcp(struct capture *ctx)
 {
-	int rv = EXIT_FAILURE;
-	FILE *r = NULL;
-	ldns_rdf *rdf = NULL;
-	ldns_rr *rr = NULL;
+	struct sockaddr_in *sai = (struct sockaddr_in *) &ctx->ss;
+	struct sockaddr_in6 *sai6 = (struct sockaddr_in6 *) &ctx->ss;
+	uint64_t port = 0;
+	char *endptr = NULL;
 
-	/* Allocate buffer for input data. */
-	static const size_t alloc_bytes = 262144;
-	uint8_t *data = calloc(1, alloc_bytes);
-	assert(data != NULL);
+	/* Parse TCP listen port. */
+	port = strtoul(ctx->args->str_read_tcp_port, &endptr, 0);
+	if (*endptr != '\0' || port > UINT16_MAX) {
+		usage("Failed to parse TCP listen port");
+		return false;
+	}
 
-	/* Open the input file stream. */
-	if (!input_fname || strcmp(input_fname, "-") == 0) {
-		r = stdin;
+	if (inet_pton(AF_INET, ctx->args->str_read_tcp_address, &sai->sin_addr) == 1) {
+		sai->sin_family = AF_INET;
+		sai->sin_port = htons(port);
+		ctx->ss_len = sizeof(*sai);
+	} else if (inet_pton(AF_INET6, ctx->args->str_read_tcp_address, &sai6->sin6_addr) == 1) {
+		sai6->sin6_family = AF_INET6;
+		sai6->sin6_port = htons(port);
+		ctx->ss_len = sizeof(*sai6);
 	} else {
-		r = fopen(input_fname, "r");
-		if (!r) {
-			fputs("Error: fopen() failed.\n", stderr);
-			goto out;
-		}
-	}
-
-	/* Read up to 'alloc_bytes' from input stream. */
-	const size_t len_data = fread(data, 1, alloc_bytes, r);
-	if (ferror(r)) {
-		fputs("Error: fread() failed.\n", stderr);
-		goto out;
-	}
-	if (!feof(r)) {
-		fputs("Error: Too much data from input.\n", stderr);
-		goto out;
-	}
-
-	/* If present, trim \# and data length, for RFC 3597 rdata. */
-	char *p = data;
-	if (len_data >= 4 &&
-	    p[0] == '\\' &&
-	    p[1] == '#' &&
-	    p[2] == ' ')
-	{
-		/* Trim the "\# ". */
-		p += 3;
-
-		/* Trim the rdata length. */
-		p = strchr(p, ' ');
-		if (!p)
-			goto out;
-	}
-
-	/* Unhexlify the data. */
-	ldns_status status = ldns_str2rdf_hex(&rdf, p);
-	if (status != LDNS_STATUS_OK) {
-		/**
-		 * Failed to parse as hex or 3597 rdata, try to parse as a
-		 * master format NULL RR, possibly in multi-line format with
-		 * comments (e.g., dig output).
-		 */
-		char *line = NULL;
-		char *saveptr = NULL;
-
-		line = strtok_r(data, "\n\r", &saveptr);
-		if (!line)
-			goto out;
-
-		do {
-			status = ldns_rr_new_frm_str(&rr, line, 0, NULL, NULL);
-			if (status == LDNS_STATUS_OK)
-				break;
-			line = strtok_r(NULL, "\n\r", &saveptr);
-		} while (line);
-
-		if (!rr) {
-			fprintf(stderr, "Error: Unable to decode as hex or RR. Bad input?\n");
-			goto out;
-		}
-
-		if (ldns_rr_get_type(rr) != LDNS_RR_TYPE_NULL) {
-			fprintf(stderr, "Error: Unexpected rrtype (%u).\n",
-				ldns_rr_get_type(rr));
-			goto out;
-		}
-
-		if (ldns_rr_rd_count(rr) != 1) {
-			fprintf(stderr, "Error: Unexpected rdf count (%zu).\n",
-				ldns_rr_rd_count(rr));
-			goto out;
-		}
-
-		rdf = ldns_rr_pop_rdf(rr);
-	}
-
-	/* Get the raw data pointer out of the wrapped ldns type. */
-	uint8_t *raw = ldns_rdf_data(rdf);
-	size_t len_raw = ldns_rdf_size(rdf);
-
-	/* Decode and print the protobuf message. */
-	if (!print_dnstap_frame(raw, len_raw, fmt, stdout)) {
-		fputs("Error: print_dnstap_frame() failed.\n", stderr);
-		goto out;
+		usage("Failed to parse TCP listen address");
+		return false;
 	}
 
 	/* Success. */
-	rv = EXIT_SUCCESS;
-
-out:
-	/* Cleanup. */
-	if (r)
-		fclose(r);
-	if (rdf)
-		ldns_rdf_deep_free(rdf);
-	if (rr)
-		ldns_rr_free(rr);
-	free(data);
-
-	return rv;
+	fprintf(stderr, "%s: opening TCP socket [%s]:%s\n",
+		argv_program, ctx->args->str_read_tcp_address, ctx->args->str_read_tcp_port);
+	return true;
 }
+
+static void
+process_data_frame(struct conn *conn)
+{
+	conn_log(CONN_TRACE, conn, "processing data frame (%u bytes)",
+		 conn->len_frame_total);
+
+	/*
+	 * Peek at 'conn->len_frame_total' bytes of data from the evbuffer, and
+	 * write them to the output file.
+	 */
+
+	/* Determine how many iovec's we need to read. */
+	const int n_vecs = evbuffer_peek(conn->ev_input, conn->len_frame_total, NULL, NULL, 0);
+
+	/* Allocate space for the iovec's. */
+	struct evbuffer_iovec vecs[n_vecs];
+
+	/* Retrieve the iovec's. */
+	const int n = evbuffer_peek(conn->ev_input, conn->len_frame_total, NULL, vecs, n_vecs);
+	assert(n == n_vecs);
+
+	/* Write each iovec to the output file. */
+	size_t bytes_read = 0;
+	for (int i = 0; i < n_vecs; i++) {
+		size_t len = vecs[i].iov_len;
+
+		/* Only read up to 'conn->len_frame_total' bytes. */
+		if (bytes_read + len > conn->len_frame_total)
+			len = conn->len_frame_total - bytes_read;
+
+		/* skip frame length uint32_t */
+		conn_log_data(CONN_TRACE, conn, vecs[i].iov_base + sizeof(uint32_t), vecs[i].iov_len - sizeof(uint32_t), "data frame (%zd) bytes: ", vecs[i].iov_len);
+
+		if (!print_dnstap_frame((uint8_t *)vecs[i].iov_base + sizeof(uint32_t), len - sizeof(uint32_t), dnstap_output_format_quiet, stdout)) {
+			fputs("Error: print_dnstap_frame() failed.\n", stderr);
+		}
+
+		bytes_read += len;
+	}
+
+	/* Check that exactly the right number of bytes were written. */
+	assert(bytes_read == conn->len_frame_total);
+
+	/* Delete the data frame from the input buffer. */
+	evbuffer_drain(conn->ev_input, conn->len_frame_total);
+
+	/* Accounting. */
+	conn->count_read += 1;
+	conn->bytes_read += bytes_read;
+	conn->ctx->count_written += 1;
+	conn->ctx->bytes_written += bytes_read;
+}
+
+static bool
+send_frame(struct conn *conn, const void *data, size_t size)
+{
+	conn_log_data(CONN_TRACE, conn, data, size, "writing frame (%zd) bytes: ", size);
+
+	if (bufferevent_write(conn->bev, data, size) != 0) {
+		conn_log(CONN_WARNING, conn, "bufferevent_write() failed");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+match_content_type(struct conn *conn)
+{
+	fstrm_res res;
+
+	/* Match the "Content Type" against ours. */
+	res = fstrm_control_match_field_content_type(conn->control,
+		(const uint8_t *) conn->ctx->args->str_content_type,
+		strlen(conn->ctx->args->str_content_type));
+	if (res != fstrm_res_success) {
+		conn_log(CONN_WARNING, conn, "no CONTENT_TYPE matching: \"%s\"",
+			 conn->ctx->args->str_content_type);
+		return false;
+	}
+
+	/* Success. */
+	return true;
+}
+
+static bool
+write_control_frame(struct conn *conn)
+{
+	fstrm_res res;
+	uint8_t control_frame[FSTRM_CONTROL_FRAME_LENGTH_MAX];
+	size_t len_control_frame = sizeof(control_frame);
+
+	/* Encode the control frame. */
+	res = fstrm_control_encode(conn->control,
+		control_frame, &len_control_frame,
+		FSTRM_CONTROL_FLAG_WITH_HEADER);
+	if (res != fstrm_res_success)
+		return false;
+
+	/* Send the control frame. */
+	fstrm_control_type type = 0;
+	(void)fstrm_control_get_type(conn->control, &type);
+	conn_log(CONN_DEBUG, conn, "sending %s (%d)",
+		fstrm_control_type_to_str(type), type);
+	if (!send_frame(conn, control_frame, len_control_frame))
+		return false;
+
+	/* Success. */
+	return true;
+}
+
+static bool
+process_control_frame_ready(struct conn *conn)
+{
+	fstrm_res res;
+
+	const uint8_t *content_type = NULL;
+	size_t len_content_type = 0;
+	size_t n_content_type = 0;
+
+	/* Retrieve the number of "Content Type" fields. */
+	res = fstrm_control_get_num_field_content_type(conn->control, &n_content_type);
+	if (res != fstrm_res_success)
+		return false;
+
+	for (size_t i = 0; i < n_content_type; i++) {
+		res = fstrm_control_get_field_content_type(conn->control, i,
+							   &content_type,
+							   &len_content_type);
+		if (res != fstrm_res_success)
+			return false;
+		conn_log_data(CONN_TRACE, conn,
+			      content_type, len_content_type,
+			      "CONTENT_TYPE [%zd/%zd] (%zd bytes): ",
+			      i + 1, n_content_type, len_content_type);
+	}
+
+	/* Match the "Content Type" against ours. */
+	if (!match_content_type(conn))
+		return false;
+
+	/* Setup the ACCEPT frame. */
+	fstrm_control_reset(conn->control);
+	res = fstrm_control_set_type(conn->control, FSTRM_CONTROL_ACCEPT);
+	if (res != fstrm_res_success)
+		return false;
+	res = fstrm_control_add_field_content_type(conn->control,
+		(const uint8_t *) conn->ctx->args->str_content_type,
+		strlen(conn->ctx->args->str_content_type));
+	if (res != fstrm_res_success)
+		return false;
+	
+	/* Send the ACCEPT frame. */
+	if (!write_control_frame(conn))
+		return false;
+
+	/* Success. */
+	conn->state = CONN_STATE_READING_CONTROL_START;
+	return true;
+}
+
+static bool
+process_control_frame_start(struct conn *conn)
+{
+	/* Match the "Content Type" against ours. */
+	if (!match_content_type(conn))
+		return false;
+	
+	/* Success. */
+	conn->state = CONN_STATE_READING_DATA;
+	return true;
+}
+
+static bool
+process_control_frame_stop(struct conn *conn)
+{
+	fstrm_res res;
+
+	/* Setup the FINISH frame. */
+	fstrm_control_reset(conn->control);
+	res = fstrm_control_set_type(conn->control, FSTRM_CONTROL_FINISH);
+	if (res != fstrm_res_success)
+		return false;
+
+	/* Send the FINISH frame. */
+	if (!write_control_frame(conn))
+		return false;
+	
+	conn->state = CONN_STATE_STOPPED;
+
+	/* We return true here, which prevents the caller from closing
+	 * the connection directly (with the FINISH frame still in our
+	 * write buffer). The connection will be closed after the FINISH
+	 * frame is written and the write callback (cb_write) is called
+	 * to refill the write buffer.
+	 */
+	return true;
+}
+
+static bool
+process_control_frame(struct conn *conn)
+{
+	fstrm_res res;
+	fstrm_control_type type;
+
+	/* Get the control frame type. */
+	res = fstrm_control_get_type(conn->control, &type);
+	if (res != fstrm_res_success)
+		return false;
+	conn_log(CONN_DEBUG, conn, "received %s (%u)",
+		 fstrm_control_type_to_str(type), type);
+
+	switch (conn->state) {
+	case CONN_STATE_READING_CONTROL_READY: {
+		if (type != FSTRM_CONTROL_READY)
+			return false;
+		return process_control_frame_ready(conn);
+	}
+	case CONN_STATE_READING_CONTROL_START: {
+		if (type != FSTRM_CONTROL_START)
+			return false;
+		return process_control_frame_start(conn);
+	}
+	case CONN_STATE_READING_DATA: {
+		if (type != FSTRM_CONTROL_STOP)
+			return false;
+		return process_control_frame_stop(conn);
+	}
+	default:
+		return false;
+	}
+
+	/* Success. */
+	return true;
+}
+
+static bool
+load_control_frame(struct conn *conn)
+{
+	fstrm_res res;
+	uint8_t *control_frame = NULL;
+
+	/* Check if the frame is too big. */
+	if (conn->len_frame_total >= FSTRM_CONTROL_FRAME_LENGTH_MAX) {
+		/* Malformed. */
+		return false;
+	}
+
+	/* Get a pointer to the full, linearized control frame. */
+	control_frame = evbuffer_pullup(conn->ev_input, conn->len_frame_total);
+	if (!control_frame) {
+		/* Malformed. */
+		return false;
+	}
+	conn_log_data(CONN_TRACE, conn, control_frame, conn->len_frame_total,
+		      "reading control frame (%u bytes): ", conn->len_frame_total);
+
+	/* Decode the control frame. */
+	res = fstrm_control_decode(conn->control,
+				   control_frame,
+				   conn->len_frame_total,
+				   FSTRM_CONTROL_FLAG_WITH_HEADER);
+	if (res != fstrm_res_success) {
+		/* Malformed. */
+		return false;
+	}
+
+	/* Drain the data read. */
+	evbuffer_drain(conn->ev_input, conn->len_frame_total);
+
+	/* Success. */
+	return true;
+}
+
+static bool
+can_read_full_frame(struct conn *conn)
+{
+	uint32_t tmp[2] = {0};
+
+	/*
+	 * This tracks the total number of bytes that must be removed from the
+	 * input buffer to read the entire frame. */
+	conn->len_frame_total = 0;
+
+	/* Check if the frame length field has fully arrived. */
+	if (conn->len_buf < sizeof(uint32_t))
+		return false;
+
+	/* Read the frame length field. */
+	evbuffer_copyout(conn->ev_input, &tmp[0], sizeof(uint32_t));
+	conn->len_frame_payload = ntohl(tmp[0]);
+
+	/* Account for the frame length field. */
+	conn->len_frame_total += sizeof(uint32_t);
+
+	/* Account for the length of the frame payload. */
+	conn->len_frame_total += conn->len_frame_payload;
+
+	/* Check if this is a control frame. */
+	if (conn->len_frame_payload == 0) {
+		uint32_t len_control_frame = 0;
+
+		/*
+		 * Check if the control frame length field has fully arrived.
+		 * Note that the input buffer hasn't been drained, so we also
+		 * need to account for the initial frame length field. That is,
+		 * there must be at least 8 bytes available in the buffer.
+		 */
+		if (conn->len_buf < 2*sizeof(uint32_t))
+			return false;
+
+		/* Read the control frame length. */
+		evbuffer_copyout(conn->ev_input, &tmp[0], 2*sizeof(uint32_t));
+		len_control_frame = ntohl(tmp[1]);
+
+		/* Account for the length of the control frame length field. */
+		conn->len_frame_total += sizeof(uint32_t);
+
+		/* Enforce minimum and maximum control frame size. */
+		if (len_control_frame < sizeof(uint32_t) ||
+		    len_control_frame > FSTRM_CONTROL_FRAME_LENGTH_MAX)
+		{
+			cb_close_conn(conn->bev, 0, conn);
+			return false;
+		}
+
+		/* Account for the control frame length. */
+		conn->len_frame_total += len_control_frame;
+	}
+
+	/*
+	 * Check if the frame has fully arrived. 'len_buf' must have at least
+	 * the number of bytes needed in order to read the full frame, which is
+	 * exactly 'len_frame_total'.
+	 */
+	if (conn->len_buf < conn->len_frame_total) {
+		conn_log(CONN_TRACE, conn, "incomplete message (have %zd bytes, want %u)",
+			 conn->len_buf, conn->len_frame_total);
+		if (conn->len_frame_total > conn->ctx->capture_highwater) {
+			conn_log(CONN_WARNING, conn,
+				"Skipping %u byte message (%zd buffer)",
+				conn->len_frame_total,
+				conn->ctx->capture_highwater);
+			conn->bytes_skip = conn->len_frame_total;
+		}
+		return false;
+	}
+
+	/* Success. The entire frame can now be read from the buffer. */
+	return true;
+}
+
+static void
+cb_write(struct bufferevent *bev, void *arg)
+{
+	struct conn *conn = (struct conn *) arg;
+
+	if (conn->state != CONN_STATE_STOPPED)
+		return;
+
+	cb_close_conn(bev, 0, arg);
+}
+
+static void
+cb_read(struct bufferevent *bev, void *arg)
+{
+	struct conn *conn = (struct conn *) arg;
+	conn->bev = bev;
+	conn->ev_input = bufferevent_get_input(conn->bev);
+	conn->ev_output = bufferevent_get_output(conn->bev);
+
+	for (;;) {
+		/* Get the number of bytes available in the buffer. */
+		conn->len_buf = evbuffer_get_length(conn->ev_input);
+
+		/* Check if there is any data available in the buffer. */
+		if (conn->len_buf <= 0)
+			return;
+
+		/* Check if the full frame has arrived. */
+		if ((conn->bytes_skip == 0) && !can_read_full_frame(conn))
+			return;
+
+		/* Skip bytes of oversized frames. */
+		if (conn->bytes_skip > 0) {
+			size_t skip = conn->bytes_skip;
+
+			if (skip > conn->len_buf)
+				skip = conn->len_buf;
+
+			conn_log(CONN_TRACE, conn, "Skipping %zd bytes", skip);
+			evbuffer_drain(conn->ev_input, skip);
+			conn->bytes_skip -= skip;
+			continue;
+		}
+
+		/* Process the frame. */
+		if (conn->len_frame_payload > 0) {
+			/* This is a data frame. */
+			process_data_frame(conn);
+
+		} else {
+			/* This is a control frame. */
+			if (!load_control_frame(conn)) {
+				/* Malformed control frame, shut down the connection. */
+				cb_close_conn(conn->bev, 0, conn);
+				return;
+			}
+
+			if (!process_control_frame(conn)) {
+				/*
+				 * Invalid control state requested, or the
+				 * end-of-stream has been reached. Shut down
+				 * the connection.
+				 */
+				cb_close_conn(conn->bev, 0, conn);
+				return;
+			}
+		}
+	}
+}
+
+static void
+cb_accept_conn(struct evconnlistener *listener, evutil_socket_t fd,
+	       __attribute__((unused)) struct sockaddr *sa,
+	       __attribute__((unused)) int socklen, void *arg)
+{
+	struct capture *ctx = (struct capture *) arg;
+	struct event_base *base = evconnlistener_get_base(listener);
+
+	/* Set up a bufferevent and per-connection context for the new connection. */
+	struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	if (!bev) {
+		if (ctx->args->debug >= CONN_ERROR)
+			fprintf(stderr, "%s: bufferevent_socket_new() failed\n",
+				argv_program);
+		evutil_closesocket(fd);
+		return;
+	}
+	struct conn *conn = conn_init(ctx);
+	bufferevent_setcb(bev, cb_read, cb_write, cb_close_conn, (void *) conn);
+	bufferevent_setwatermark(bev, EV_READ, 0, ctx->capture_highwater);
+	bufferevent_enable(bev, EV_READ | EV_WRITE);
+
+	if (ctx->args->debug >= CONN_INFO)
+		fprintf(stderr, "%s: accepted new connection fd %d\n", argv_program, fd);
+
+	ctx->remaining_connections--;
+	if (ctx->remaining_connections == 0)
+		evconnlistener_disable(listener);
+}
+
+static void
+cb_accept_error(__attribute__((unused)) struct evconnlistener *listener,
+	        __attribute__((unused)) void *arg)
+{
+	const int err = EVUTIL_SOCKET_ERROR();
+	fprintf(stderr, "%s: accept() failed: %s\n", argv_program,
+		evutil_socket_error_to_string(err));
+}
+
+static bool
+setup_event_loop(struct capture *ctx)
+{
+	/* Create the event base. */
+	ctx->ev_base = event_base_new();
+	if (!ctx->ev_base)
+		return false;
+
+	/* Create the evconnlistener. */
+	unsigned flags = 0;
+	flags |= LEV_OPT_CLOSE_ON_FREE; /* Closes underlying sockets. */
+	flags |= LEV_OPT_CLOSE_ON_EXEC; /* Sets FD_CLOEXEC on underlying fd's. */
+	flags |= LEV_OPT_REUSEABLE; /* Sets SO_REUSEADDR on listener. */
+
+	ctx->ev_connlistener = evconnlistener_new_bind(ctx->ev_base,
+		cb_accept_conn, (void *) ctx, flags, -1,
+		(struct sockaddr *) &ctx->ss, ctx->ss_len);
+	if (!ctx->ev_connlistener) {
+		event_base_free(ctx->ev_base);
+		ctx->ev_base = NULL;
+		return false;
+	}
+	evconnlistener_set_error_cb(ctx->ev_connlistener, cb_accept_error);
+
+	/* Success. */
+	return true;
+}
+
+static void
+shutdown_handler(int signum __attribute__((unused)))
+{
+	event_base_loopexit(g_program_ctx.ev_base, NULL);
+}
+
+static bool
+setup_signals(void)
+{
+	struct sigaction sa = {
+		.sa_handler = shutdown_handler,
+	};
+
+	if (sigemptyset(&sa.sa_mask) != 0)
+		return false;
+	if (sigaction(SIGTERM, &sa, NULL) != 0)
+		return false;
+	if (sigaction(SIGINT, &sa, NULL) != 0)
+		return false;
+
+	sa.sa_handler = SIG_IGN;
+	if (sigaction(SIGPIPE, &sa, NULL) != 0)
+		return false;
+
+	/* Success. */
+	return true;
+}
+
+static void
+cleanup(struct capture *ctx)
+{
+	argv_cleanup(g_args);
+
+	if (ctx->ev_connlistener != NULL)
+		evconnlistener_free(ctx->ev_connlistener);
+	if (ctx->ev_base != NULL)
+		event_base_free(ctx->ev_base);
+}
+
+/*
+ * fprintf(stderr, "Quiet text output format mnemonics:\n");
+ * fprintf(stderr, "  AQ: AUTH_QUERY\n");
+ * fprintf(stderr, "  AR: AUTH_RESPONSE\n");
+ * fprintf(stderr, "  RQ: RESOLVER_QUERY\n");
+ * fprintf(stderr, "  RR: RESOLVER_RESPONSE\n");
+ * fprintf(stderr, "  CQ: CLIENT_QUERY\n");
+ * fprintf(stderr, "  CR: CLIENT_RESPONSE\n");
+ * fprintf(stderr, "  FQ: FORWARDER_QUERY\n");
+ * fprintf(stderr, "  FR: FORWARDER_RESPONSE\n");
+ * fprintf(stderr, "  SQ: STUB_QUERY\n");
+ * fprintf(stderr, "  SR: STUB_RESPONSE\n");
+ * fprintf(stderr, "  TQ: TOOL_QUERY\n");
+ * fprintf(stderr, "  TR: TOOL_RESPONSE\n");
+ * fprintf(stderr, "\n");
+ */
 
 int
 main(int argc, char **argv)
 {
-	int c;
-	int rv = EXIT_FAILURE;
-	const char *input_fname = NULL;
-	dnstap_input_format in_fmt = dnstap_input_format_frame_stream;
-	dnstap_output_format out_fmt = dnstap_output_format_quiet;
-
-	/* Args. */
-	while ((c = getopt(argc, argv, "qyxr:")) != -1) {
-		switch (c) {
-		case 'q':
-			out_fmt = dnstap_output_format_quiet;
-			break;
-		case 'y':
-			out_fmt = dnstap_output_format_yaml;
-			break;
-		case 'x':
-			in_fmt = dnstap_input_format_hex;
-			break;
-		case 'r':
-			input_fname = optarg;
-			break;
-		default:
-			usage();
-		}
+	/* Parse arguments. */
+	if (!parse_args(argc, argv, &g_program_ctx)) {
+		usage(NULL);
+		return EXIT_FAILURE;
 	}
-	argc -= optind;
-	argv += optind;
-	if (argc != 0)
-		usage();
+	g_program_ctx.args = &g_program_args;
 
-	if (in_fmt == dnstap_input_format_frame_stream) {
-		rv = read_input_frame_stream(input_fname, out_fmt);
-	} else if (in_fmt == dnstap_input_format_hex) {
-		rv = read_input_hex(input_fname, out_fmt);
+	if (g_program_ctx.args->str_read_tcp_address != NULL &&
+		   g_program_ctx.args->str_read_tcp_port != NULL) {
+		if (!open_read_tcp(&g_program_ctx))
+			return EXIT_FAILURE;
 	} else {
-		rv = EXIT_FAILURE;
+		fprintf(stderr, "%s: failed to setup a listening socket\n", argv_program);
+		return EXIT_FAILURE;
 	}
 
-	return rv;
+	/* Setup the event loop. */
+	if (!setup_event_loop(&g_program_ctx)) {
+		fprintf(stderr, "%s: failed to setup event loop\n", argv_program);
+		return EXIT_FAILURE;
+	}
+
+	/* Setup signals. */
+	if (!setup_signals()) {
+		fprintf(stderr, "%s: failed to setup signals\n", argv_program);
+		return EXIT_FAILURE;
+	}
+
+	/* Run the event loop. */
+	if (event_base_dispatch(g_program_ctx.ev_base) != 0) {
+		fprintf(stderr, "%s: failed to start event loop\n", argv_program);
+		return EXIT_FAILURE;
+	}
+
+	fprintf(stderr, "%s: shutting down\n", argv_program);
+
+	/* Shut down. */
+	cleanup(&g_program_ctx);
+
+	/* Success. */
+	return EXIT_SUCCESS;
 }
