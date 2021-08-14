@@ -520,6 +520,8 @@ print_dnstap_frame(const uint8_t *data, size_t len_data, dnstap_output_format fm
 
 	if (!print_dnstap_frame_quiet(d, fp))
 		goto out;
+		
+	fflush(fp);
 
 	/* Success. */
 	rv = true;
