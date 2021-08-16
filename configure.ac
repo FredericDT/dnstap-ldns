@@ -23,6 +23,18 @@ my_CFLAGS="-Wall \
 -Wformat-security"
 AC_SUBST([my_CFLAGS])
 
+AC_MSG_CHECKING([build with debug output])
+AC_ARG_ENABLE([debug],
+              [AS_HELP_STRING([--enable-debug],
+                              [enable debug output [default=no]])],
+                              [debug_enabled="$enableval"],
+                              [debug_enabled=no])
+AC_MSG_RESULT([$debug_enabled])
+
+if test x"$debug_enabled" != x"yes"; then
+    AC_DEFINE([NDEBUG], [1], [liblogfaf no debug output])
+fi
+
 AC_CONFIG_HEADERS(config.h)
 AC_CONFIG_FILES([Makefile])
 

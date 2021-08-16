@@ -4,3 +4,6 @@
 [submodule "fstrm"]
 	path = fstrm
 	url = git@github.com:farsightsec/fstrm.git
+[submodule "liblogfaf"]
+	path = liblogfaf
+	url = git@github.com:FredericDT/liblogfaf.git

@@ -25,6 +25,7 @@ dnstap_ldns_SOURCES = \
 	dnstap-ldns.c \
 	host2str.c \
 	fstrm/libmy/argv.c \
+	liblogfaf/src/liblogfaf.c \
 	${PROTOBUF_SOURCES}
 dnstap_ldns_CFLAGS = \
 	${libldns_CFLAGS} \

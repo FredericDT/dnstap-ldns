@@ -31,6 +31,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <syslog.h>
 
 #include <fstrm.h>
 #include <ldns/ldns.h>
@@ -45,6 +46,8 @@
 #include "fstrm/libmy/argv.h"
 #include "fstrm/libmy/my_alloc.h"
 #include "fstrm/libmy/print_string.h"
+
+#include "liblogfaf/src/liblogfaf.h"
 
 /* From our host2str.c. */
 ldns_status my_ldns_pktheader2buffer_str(ldns_buffer *, const ldns_pkt *);
@@ -124,6 +127,12 @@ struct capture_args {
 	int			count_connections;
 };
 
+struct dnstap_syslog {
+	time_t			time;
+	/* RFC5424 suggests that everybody be able to handle at least 2048 octets */
+	char			message[2048];
+};
+
 static const char g_dnstap_content_type[] = "protobuf:dnstap.Dnstap";
 
 static struct capture		g_program_ctx;
@@ -172,7 +181,7 @@ static argv_t g_args[] = {
 };
 
 static bool
-print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
+dns_question_str(const ProtobufCBinaryData *message, char *message_buf)
 {
 	char *str = NULL;
 	ldns_pkt *pkt = NULL;
@@ -198,26 +207,26 @@ print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
 
 	if (status == LDNS_STATUS_OK && rr && qname) {
 		/* Print the question name. */
-		fputc('"', fp);
+		strcat(message_buf, "\"");
 		/* ldns_rdf_print(fp, qname); */
-		char * qname_str = ldns_rdf2str(qname);
-		fprintf(fp, "%s", qname_str);
-		fputc('"', fp);
-		free(qname_str);
+		str = ldns_rdf2str(qname);
+		strncat(message_buf, str, LDNS_MAX_DOMAINLEN);
+		strcat(message_buf, "\"");
+		free(str);
 
 		/* Print the question class. */
 		str = ldns_rr_class2str(qclass);
-		fputc(' ', fp);
-		fputs(str, fp);
+		strcat(message_buf, " ");
+		strncat(message_buf, str, 8);
 		free(str);
 
 		/* Print the question type. */
 		str = ldns_rr_type2str(qtype);
-		fputc(' ', fp);
-		fputs(str, fp);
+		strcat(message_buf, " ");
+		strncat(message_buf, str, 16);
 		free(str);
 	} else {
-		fputs("? ? ?", fp);
+		strcat(message_buf, "? ? ?");
 	}
 
 	/* Cleanup. */
@@ -229,7 +238,7 @@ print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
 }
 
 static bool
-print_ip_address(const ProtobufCBinaryData *ip, FILE *fp)
+ip_address_str(const ProtobufCBinaryData *ip, char *message_buf)
 {
 	char buf[INET6_ADDRSTRLEN] = {0};
 
@@ -247,14 +256,14 @@ print_ip_address(const ProtobufCBinaryData *ip, FILE *fp)
 	}
 
 	/* Print the presentation form of the IP address. */
-	fputs(buf, fp);
+	strncat(message_buf, buf, INET6_ADDRSTRLEN);
 
 	/* Success. */
 	return true;
 }
 
 static bool
-print_timestamp(uint64_t timestamp_sec, uint32_t timestamp_nsec, FILE *fp)
+timestamp_str(uint64_t timestamp_sec, uint32_t timestamp_nsec, char *message_buf)
 {
 	static const char *fmt = "%F %H:%M:%S";
 
@@ -271,15 +280,20 @@ print_timestamp(uint64_t timestamp_sec, uint32_t timestamp_nsec, FILE *fp)
 		return false;
 
 	/* Print the timestamp. */
-	fputs(buf, fp);
-	fprintf(fp, ".%06u", timestamp_nsec / 1000);
+	strncat(message_buf, buf, 100);
+
+	char timestamp_nsec_str[8] = {0};
+
+	snprintf(timestamp_nsec_str, 7, ".%06u", timestamp_nsec / 1000);
+
+	strncat(message_buf, timestamp_nsec_str, 7);
 
 	/* Success. */
 	return true;
 }
 
 static bool
-print_dnstap_message_quiet(const Dnstap__Message *m, FILE *fp)
+dnstap_message_quiet_to_dnstap_syslog(const Dnstap__Message *m, struct dnstap_syslog *dnstap_syslog_buf)
 {
 	bool is_query = false;
 	bool print_query_address = false;
@@ -302,58 +316,62 @@ print_dnstap_message_quiet(const Dnstap__Message *m, FILE *fp)
 		is_query = false;
 		break;
 	default:
-		fputs("[unhandled Dnstap.Message.Type]\n", fp);
+		syslog(LOG_WARNING, "[unhandled Dnstap.Message.Type]");
 		return true;
 	}
 
 	/* Print timestamp. */
 	if (is_query) {
-		if (m->has_query_time_sec && m->has_query_time_nsec)
-			print_timestamp(m->query_time_sec, m->query_time_nsec, fp);
-		else
-			fputs("??:??:??.??????", fp);
+		if (m->has_query_time_sec && m->has_query_time_nsec) {
+			dnstap_syslog_buf->time = m->query_time_sec;
+			timestamp_str(m->query_time_sec, m->query_time_nsec, dnstap_syslog_buf->message);
+		} else {
+			strcat(dnstap_syslog_buf->message, "??:??:??.??????");
+		}
 	} else {
-		if (m->has_response_time_sec && m->has_response_time_nsec)
-			print_timestamp(m->response_time_sec, m->response_time_nsec, fp);
-		else
-			fputs("??:??:??.??????", fp);
+		if (m->has_response_time_sec && m->has_response_time_nsec) {
+			dnstap_syslog_buf->time = m->response_time_sec;
+			timestamp_str(m->response_time_sec, m->response_time_nsec, dnstap_syslog_buf->message);
+		} else {
+			strcat(dnstap_syslog_buf->message, "??:??:??.??????");
+		}
 	}
-	fputc(' ', fp);
+	strcat(dnstap_syslog_buf->message, " ");
 
 	/* Print message type mnemonic. */
 	switch (m->type) {
 	case DNSTAP__MESSAGE__TYPE__AUTH_QUERY:
 	case DNSTAP__MESSAGE__TYPE__AUTH_RESPONSE:
-		fputc('A', fp);
+		strcat(dnstap_syslog_buf->message, "A");
 		break;
 	case DNSTAP__MESSAGE__TYPE__CLIENT_QUERY:
 	case DNSTAP__MESSAGE__TYPE__CLIENT_RESPONSE:
-		fputc('C', fp);
+		strcat(dnstap_syslog_buf->message, "C");
 		break;
 	case DNSTAP__MESSAGE__TYPE__FORWARDER_QUERY:
 	case DNSTAP__MESSAGE__TYPE__FORWARDER_RESPONSE:
-		fputc('F', fp);
+		strcat(dnstap_syslog_buf->message, "F");
 		break;
 	case DNSTAP__MESSAGE__TYPE__RESOLVER_QUERY:
 	case DNSTAP__MESSAGE__TYPE__RESOLVER_RESPONSE:
-		fputc('R', fp);
+		strcat(dnstap_syslog_buf->message, "R");
 		break;
 	case DNSTAP__MESSAGE__TYPE__STUB_QUERY:
 	case DNSTAP__MESSAGE__TYPE__STUB_RESPONSE:
-		fputc('S', fp);
+		strcat(dnstap_syslog_buf->message, "S");
 		break;
 	case DNSTAP__MESSAGE__TYPE__TOOL_QUERY:
 	case DNSTAP__MESSAGE__TYPE__TOOL_RESPONSE:
-		fputc('T', fp);
+		strcat(dnstap_syslog_buf->message, "T");
 		break;
 	default:
-		fputc('?', fp);
+		strcat(dnstap_syslog_buf->message, "?");
 		break;
 	}
 	if (is_query)
-		fputs("Q ", fp);
+		strcat(dnstap_syslog_buf->message, "Q ");
 	else
-		fputs("R ", fp);
+		strcat(dnstap_syslog_buf->message, "R ");
 
 	/* Print query address or response address. */
 	switch (m->type) {
@@ -369,16 +387,16 @@ print_dnstap_message_quiet(const Dnstap__Message *m, FILE *fp)
 	}
 	if (print_query_address) {
 		if (m->has_query_address)
-			print_ip_address(&m->query_address, fp);
+			ip_address_str(&m->query_address, dnstap_syslog_buf->message);
 		else
-			fputs("MISSING_ADDRESS", fp);
+			strcat(dnstap_syslog_buf->message, "MISSING_ADDRESS");
 	} else {
 		if (m->has_response_address)
-			print_ip_address(&m->response_address, fp);
+			ip_address_str(&m->response_address, dnstap_syslog_buf->message);
 		else
-			fputs("MISSING_ADDRESS", fp);
+			strcat(dnstap_syslog_buf->message, "MISSING_ADDRESS");
 	}
-	fputc(' ', fp);
+	strcat(dnstap_syslog_buf->message, " ");
 
 	/* Print socket protocol. */
 	if (m->has_socket_protocol) {
@@ -387,47 +405,55 @@ print_dnstap_message_quiet(const Dnstap__Message *m, FILE *fp)
 				&dnstap__socket_protocol__descriptor,
 				m->socket_protocol);
 		if (type)
-			fputs(type->name, fp);
+			strcat(dnstap_syslog_buf->message, type->name);
 		else
-			fputs("?", fp);
+			strcat(dnstap_syslog_buf->message, "?");
 	} else {
-		fputs("?", fp);
+		strcat(dnstap_syslog_buf->message, "?");
 	}
-	fputc(' ', fp);
+	strcat(dnstap_syslog_buf->message, " ");
 
 	/* Print message size. */
+	char message_size_str[14] = {0};
 	if (is_query && m->has_query_message) {
-		fprintf(fp, "%zdb ", m->query_message.len);
+		snprintf(message_size_str, 13, "%zdb ", m->query_message.len);
 	} else if (!is_query && m->has_response_message) {
-		fprintf(fp, "%zdb ", m->response_message.len);
+		snprintf(message_size_str, 13, "%zdb ", m->response_message.len);
 	} else {
-		fprintf(fp, "0b ");
+		strcat(dnstap_syslog_buf->message, "0b ");
 	}
+	strncat(dnstap_syslog_buf->message, message_size_str, 13);
 
 	/* Print question. */
 	if (is_query && m->has_query_message) {
-		if (!print_dns_question(&m->query_message, fp))
+		if (!dns_question_str(&m->query_message, dnstap_syslog_buf->message))
 			return false;
 	} else if (!is_query && m->has_response_message) {
-		if (!print_dns_question(&m->response_message, fp))
+		if (!dns_question_str(&m->response_message, dnstap_syslog_buf->message))
 			return false;
 	} else {
-		fputs("? ? ?", fp);
+		strcat(dnstap_syslog_buf->message, "? ? ?");
 	}
-
-	fputc('\n', fp);
 
 	/* Success. */
 	return true;
 }
 
 static bool
-print_dnstap_frame_quiet(const Dnstap__Dnstap *d, FILE *fp)
+syslog_dnstap_frame_quiet(const Dnstap__Dnstap *d)
 {
+
+	struct dnstap_syslog dnstap_syslog_buf = {
+		.message = {0}
+	};
+
 	if (d->type == DNSTAP__DNSTAP__TYPE__MESSAGE && d->message != NULL) {
-		return print_dnstap_message_quiet(d->message, fp);
+		if (dnstap_message_quiet_to_dnstap_syslog(d->message, &dnstap_syslog_buf)) {
+			syslog_time(LOG_INFO, dnstap_syslog_buf.time, dnstap_syslog_buf.message);
+			return true;
+		}
 	} else {
-		fputs("[unhandled Dnstap.Type]\n", fp);
+		syslog(LOG_WARNING, "[unhandled Dnstap.Type]");
 	}
 
 	/* Success. */
@@ -435,7 +461,7 @@ print_dnstap_frame_quiet(const Dnstap__Dnstap *d, FILE *fp)
 }
 
 static bool
-print_dnstap_frame(const uint8_t *data, size_t len_data, FILE *fp)
+print_dnstap_frame(const uint8_t *data, size_t len_data)
 {
 	bool rv = false;
 	Dnstap__Dnstap *d = NULL;
@@ -449,10 +475,8 @@ print_dnstap_frame(const uint8_t *data, size_t len_data, FILE *fp)
 		goto out;
 	}
 
-	if (!print_dnstap_frame_quiet(d, fp))
+	if (!syslog_dnstap_frame_quiet(d))
 		goto out;
-
-	fflush(fp);
 
 	/* Success. */
 	rv = true;
@@ -654,7 +678,7 @@ process_data_frame(struct conn *conn)
 			vecs[i].iov_len, "data frame (%zd) bytes: ", vecs[i].iov_len);
 
 		if (!print_dnstap_frame((uint8_t *)vecs[i].iov_base + sizeof(uint32_t), 
-			len - sizeof(uint32_t), stdout)) {
+			len - sizeof(uint32_t))) {
 			fputs("Error: print_dnstap_frame() failed.\n", stderr);
 		}
 
