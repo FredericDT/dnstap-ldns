@@ -126,17 +126,6 @@ struct capture_args {
 
 static const char g_dnstap_content_type[] = "protobuf:dnstap.Dnstap";
 
-typedef enum {
-	dnstap_input_format_frame_stream = 0,
-	dnstap_input_format_hex = 1,
-} dnstap_input_format;
-
-typedef enum {
-	dnstap_output_format_yaml = 0,
-	dnstap_output_format_quiet = 1,
-} dnstap_output_format;
-
-
 static struct capture		g_program_ctx;
 static struct capture_args	g_program_args = {
 	.str_content_type = g_dnstap_content_type, 
@@ -182,7 +171,6 @@ static argv_t g_args[] = {
 	{ ARGV_LAST, 0, 0, 0, 0, 0 },
 };
 
-
 static bool
 print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
 {
@@ -211,8 +199,11 @@ print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
 	if (status == LDNS_STATUS_OK && rr && qname) {
 		/* Print the question name. */
 		fputc('"', fp);
-		ldns_rdf_print(fp, qname);
+		/* ldns_rdf_print(fp, qname); */
+		char * qname_str = ldns_rdf2str(qname);
+		fprintf(fp, "%s", qname_str);
 		fputc('"', fp);
+		free(qname_str);
 
 		/* Print the question class. */
 		str = ldns_rr_class2str(qclass);
@@ -234,66 +225,6 @@ print_dns_question(const ProtobufCBinaryData *message, FILE *fp)
 		ldns_pkt_free(pkt);
 
 	/* Success. */
-	return true;
-}
-
-static bool
-print_dns_message(const ProtobufCBinaryData *message, const char *field_name, FILE *fp)
-{
-	char *str = NULL;
-	ldns_buffer *buf = NULL;
-	ldns_pkt *pkt = NULL;
-	ldns_status status;
-
-	/* Initialize 'buf'. */
-	buf = ldns_buffer_new(LDNS_MAX_PACKETLEN);
-	if (!buf)
-		return false;
-
-	/* Parse the raw wire message. */
-	status = ldns_wire2pkt(&pkt, message->data, message->len);
-	if (status == LDNS_STATUS_OK) {
-		/* Print the message, indented with spaces. */
-		fprintf(fp, "  %s: |\n", field_name);
-
-		status = my_ldns_pkt2buffer_str_fmt(buf, ldns_output_format_default, pkt);
-		if (status == LDNS_STATUS_OK) {
-			str = ldns_buffer_export2str(buf);
-			fputs(str, fp);
-		}
-	} else {
-		/* Parse failure. */
-		fprintf(fp, "  # %s: parse failed\n", field_name);
-	}
-
-	/* Cleanup. */
-	free(str);
-	if (pkt != NULL)
-		ldns_pkt_free(pkt);
-	if (buf != NULL)
-		ldns_buffer_free(buf);
-
-	/* Success. */
-	return true;
-}
-
-static bool
-print_domain_name(const ProtobufCBinaryData *domain, FILE *fp)
-{
-	/* Wrap the binary data in 'domain' into an 'ldns_rdf'. */
-	ldns_rdf *dname;
-	assert(domain->data != NULL);
-	dname = ldns_dname_new(domain->len, domain->data);
-	if (!dname)
-		return false;
-
-	/* Print the presentation form of the domain name. */
-	fputc('"', fp);
-	ldns_rdf_print(fp, dname);
-	fputc('"', fp);
-
-	/* Success. */
-	ldns_rdf_free(dname);
 	return true;
 }
 
@@ -504,7 +435,7 @@ print_dnstap_frame_quiet(const Dnstap__Dnstap *d, FILE *fp)
 }
 
 static bool
-print_dnstap_frame(const uint8_t *data, size_t len_data, dnstap_output_format fmt, FILE *fp)
+print_dnstap_frame(const uint8_t *data, size_t len_data, FILE *fp)
 {
 	bool rv = false;
 	Dnstap__Dnstap *d = NULL;
@@ -723,7 +654,7 @@ process_data_frame(struct conn *conn)
 			vecs[i].iov_len, "data frame (%zd) bytes: ", vecs[i].iov_len);
 
 		if (!print_dnstap_frame((uint8_t *)vecs[i].iov_base + sizeof(uint32_t), 
-			len - sizeof(uint32_t), dnstap_output_format_quiet, stdout)) {
+			len - sizeof(uint32_t), stdout)) {
 			fputs("Error: print_dnstap_frame() failed.\n", stderr);
 		}
 
